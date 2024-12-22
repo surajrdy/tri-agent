@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 import math
 
 class RobustEnvironment:
-    def __init__(self, state_dim=8, action_dim=4, randomization_range=0.2):
+    def __init__(self, state_dim=8, action_dim=8, randomization_range=0.2):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.randomization_range = randomization_range
@@ -25,11 +25,17 @@ class RobustEnvironment:
                 for k, v in self.uncertainty_set.items()}
     
     def step(self, state, action, params):
+        if action.size(0) != state.size(0):
+            action = action.expand(state.size(0), -1)
+            
         noise = torch.randn_like(state) * params['noise']
         next_state = (state + action * params['force'] / params['mass'] + noise) * params['friction']
         reward = -torch.norm(next_state)
         done = torch.norm(next_state) > 10
         return next_state, reward, done
+    
+    def reset(self):
+        return torch.zeros(self.state_dim)
 
 class DirectorAgent(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -59,7 +65,8 @@ class DirectorAgent(nn.Module):
 class SocialLearningAgent(nn.Module):
     def __init__(self, state_dim, num_agents):
         super().__init__()
-        self.attention = nn.MultiheadAttention(state_dim, num_heads=4)
+        self.state_dim = state_dim
+        self.attention = nn.MultiheadAttention(state_dim, num_heads=4, batch_first=True)
         self.mask_network = nn.Sequential(
             nn.Linear(state_dim, 128),
             nn.ReLU(),
@@ -69,30 +76,25 @@ class SocialLearningAgent(nn.Module):
             nn.Sigmoid()
         )
         self.history_buffer = []
-        
-    def compute_inverse_attention(self, Q, K):
-        attention = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Q.size(-1))
-        mu = self.mask_network(Q)
-        return attention * (1 - mu)
     
     def forward(self, state, other_states):
-        if len(self.history_buffer) > 0:
-            historical_states = torch.stack(self.history_buffer[-5:])
-            other_states = torch.cat([other_states, historical_states])
+        if state.dim() == 1:
+            state = state.unsqueeze(0).unsqueeze(0)
+        elif state.dim() == 2:
+            state = state.unsqueeze(0)
         
-        masks = self.mask_network(state)
+        if other_states.dim() == 2:
+            other_states = other_states.unsqueeze(0)
+        
+        masks = self.mask_network(state.squeeze(0))
+        
         attended, _ = self.attention(
-            state.unsqueeze(0),
-            other_states.unsqueeze(0),
-            other_states.unsqueeze(0),
-            key_padding_mask=(masks > 0.5).unsqueeze(0)
+            state,
+            other_states,
+            other_states
         )
         
-        self.history_buffer.append(state.detach())
-        if len(self.history_buffer) > 100:
-            self.history_buffer.pop(0)
-        
-        return attended.squeeze(0), masks
+        return attended.squeeze(0), masks.detach()
 
 class ExecutionAgent(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -109,6 +111,9 @@ class ExecutionAgent(nn.Module):
             nn.LayerNorm(128),
             nn.Linear(128, 1)
         )
+        
+    def forward(self, state):
+        return self.actor(state)
 
 class TriAgentTrainer:
     def __init__(self, env, director, social, executor):
@@ -124,7 +129,7 @@ class TriAgentTrainer:
         }
     
     def train_episode(self, num_steps=1000):
-        state = torch.zeros(self.env.state_dim)
+        state = self.env.reset()
         episode_rewards = []
         attention_masks = []
         uncertainty_metrics = []
@@ -137,24 +142,31 @@ class TriAgentTrainer:
             other_states = torch.randn(3, self.env.state_dim)
             social_state, masks = self.social(state, other_states)
             
+            mask_np = masks.detach().cpu().numpy()
+            if len(mask_np.shape) > 1:
+                mask_np = mask_np.reshape(-1)
+            
             rewards_under_uncertainty = []
             for params in params_samples:
-                final_action = self.executor.actor(social_state)
+                final_action = self.executor(social_state)
                 _, reward, _ = self.env.step(state, final_action, params)
                 rewards_under_uncertainty.append(reward.item())
             
             worst_reward = min(rewards_under_uncertainty)
             episode_rewards.append(worst_reward)
-            attention_masks.append(masks.detach().numpy())
+            attention_masks.append(mask_np)
             uncertainty_metrics.append(np.std(rewards_under_uncertainty))
             
             avg_params = {k: np.mean([p[k] for p in params_samples]) 
-                         for k in params_samples[0].keys()}
+                        for k in params_samples[0].keys()}
             next_state, _, done = self.env.step(state, final_action, avg_params)
             
             if done:
                 break
             state = next_state
+        
+        max_len = max(len(mask) if isinstance(mask, np.ndarray) else 0 for mask in attention_masks)
+        attention_masks = np.array([np.pad(mask, (0, max_len - len(mask)), mode='constant') if len(mask) < max_len else mask for mask in attention_masks])
         
         self.metrics['rewards'].append(np.mean(episode_rewards))
         self.metrics['attention_masks'].append(np.mean(attention_masks, axis=0))
@@ -163,7 +175,7 @@ class TriAgentTrainer:
         
         return np.mean(episode_rewards)
 
-    def visualize_metrics(self):
+    def visualize_final_metrics(self):
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
         axes[0,0].plot(self.metrics['rewards'])
@@ -195,7 +207,7 @@ def main():
         reward = trainer.train_episode()
         if episode % 10 == 0:
             print(f"Episode {episode}, Reward: {reward:.3f}")
-            trainer.visualize_metrics()
+    trainer.visualize_final_metrics()
 
 if __name__ == "__main__":
     main()
