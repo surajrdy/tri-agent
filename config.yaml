@@ -1,0 +1,17 @@
+# config.yaml
+planner:
+  model: "gpt-4"
+  temperature: 0.7
+  
+tester:
+  model: "gpt-4" 
+  temperature: 0.5
+
+optimizer:
+  model: "gpt-4"
+  temperature: 0.6
+
+env:
+  data_path: "alfworld_data"
+  
+max_iterations: 5
